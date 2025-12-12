@@ -19,6 +19,9 @@ static void onenet_subscribe(void);
 
 static esp_err_t onenet_property_get_ack(const char* id, int code, const char* msg);
 
+static void onenet_ota_ack(const char* id,int code,const char* msg);
+
+
 /**
  * mqtt连接事件处理函数
  * @param event 事件参数
@@ -61,7 +64,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             cJSON* property_json = cJSON_Parse(event->data);
             cJSON* id_js = cJSON_GetObjectItem(property_json,"id");
             onenet_property_handle(property_json); //处理属性设置下行
-            onenet_property_ack(cJSON_GetStringValue(id_js), 200, "OK");
+            onenet_property_ack(cJSON_GetStringValue(id_js), 200, "success");
             cJSON_Delete(property_json);
         }
 
@@ -74,6 +77,15 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             onenet_property_get_ack(cJSON_GetStringValue(id_js), 200, "success");
                 
             cJSON_Delete(request_json);
+        }
+        else if(strstr(event->topic,"ota/inform")) //OTA更新下行
+        {
+            cJSON* ota_json = cJSON_Parse(event->data);
+            cJSON* id_js = cJSON_GetObjectItem(ota_json,"id");
+            onenet_ota_ack(cJSON_GetStringValue(id_js), 200, "success");
+            cJSON_Delete(ota_json);
+            // 处理OTA更新逻辑
+            
         }
 
 
@@ -121,6 +133,21 @@ static void onenet_property_ack(const char* id,int code,const char* msg)
     free(replay_str);
 }
 
+static void onenet_ota_ack(const char* id,int code,const char* msg)
+{
+    char topic[128];
+    sprintf(topic,"$sys/%s/%s/ota/inform_reply",ONENET_PRODUCT_ID,ONENET_DEVICE_NAME);
+    cJSON* replay_js = cJSON_CreateObject();
+    cJSON_AddStringToObject(replay_js,"id",id);
+    cJSON_AddNumberToObject(replay_js,"code",code);
+    cJSON_AddStringToObject(replay_js,"msg",msg);
+    char* replay_str = cJSON_PrintUnformatted(replay_js);
+    esp_mqtt_client_publish(mqtt_handle,topic,replay_str,strlen(replay_str),1,0);//发布属性设置回复
+    cJSON_Delete(replay_js);
+    free(replay_str);
+}
+
+
 static void onenet_subscribe(void)
 {
     char topic[128]; 
@@ -135,6 +162,11 @@ static void onenet_subscribe(void)
 
     sprintf(topic,"$sys/%s/%s/thing/property/get/reply",ONENET_PRODUCT_ID,ONENET_DEVICE_NAME);
     esp_mqtt_client_subscribe_single(mqtt_handle,topic,1); //订阅属性获取回复主题
+
+    sprintf(topic,"$sys/%s/%s/ota/inform",ONENET_PRODUCT_ID,ONENET_DEVICE_NAME);
+    esp_mqtt_client_subscribe_single(mqtt_handle,topic,1); //订阅OTA更新下行主题
+
+
 
 }
 
@@ -170,3 +202,5 @@ static esp_err_t onenet_property_get_ack(const char* id, int code, const char* m
     cJSON_Delete(reply_js);
     return ESP_OK;
 }
+
+
