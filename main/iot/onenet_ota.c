@@ -7,6 +7,10 @@
 #include "onenet_mqtt.h"
 #include "string.h"
 #include "cJSON.h"
+#include "esp_https_ota.h"
+#include "esp_system.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 
 #define TAG "ONENET_OTA"
@@ -17,11 +21,13 @@
 
 static char target_version[32] = {0};
 static int task_id = 0;
+static bool ota_is_running = false;
+
 
 const char* get_app_version(void) //获取当前应用版本号
 {
     static char app_version[32] = {0};
-    if(app_version[0] != 0)
+    if(app_version[0] == 0)
     {
         const esp_partition_t * running =  esp_ota_get_running_partition(); //获取当前运行分区
         esp_app_desc_t app_desc;
@@ -43,12 +49,12 @@ void set_app_valid(int valid) //
             if(valid)
             {
                 esp_ota_mark_app_valid_cancel_rollback(); //设置当前分区为有效，取消回滚
-                ESP_LOGE("Set app valid success\r\n");
+                ESP_LOGE(TAG ,"Set app valid success\r\n");
             }
             else
             {
                 esp_ota_mark_app_invalid_rollback_and_reboot(); //设置当前分区为无效，回滚到上一个分区并重启
-                ESP_LOGE("Set app invalid and reboot\r\n");
+                ESP_LOGE(TAG ,"Set app invalid and reboot\r\n");
             }
         }
     }
@@ -165,9 +171,11 @@ esp_err_t onenet_ota_upload_version(void) //
             cJSON *code_js = cJSON_GetObjectItem(root, "code");
             if(code_js && cJSON_GetNumberValue(code_js) == 0)
             {
-                ESP_LOGE(TAG, "OTA version upload failed, code: %d", code_js->valueint);
                 ret = ESP_OK;
-                cJSON_Delete(root);
+            }
+            else
+            {
+                if(code_js) ESP_LOGE(TAG, "OTA version upload failed, code: %d", (int)cJSON_GetNumberValue(code_js));
             }
             cJSON_Delete(root);
         }
@@ -209,42 +217,53 @@ Content-Length:20
 }
 */
 
-esp_err_t onenet_ota_check_task(const char* type,const char* version)
+/**
+ * 查询升级任务状态
+ * @param type = 1,说明是完整包，type=2,说明是差分包
+ * @param version 当前设备版本
+ * @return 错误码
+ */
+esp_err_t  onenet_ota_check_task(const char* type,const char* version)
 {
-    char url[128] = {0};
-    const char * app_version = get_app_version();
+    char url[256];
     esp_err_t ret = ESP_FAIL;
-    snprintf(url,sizeof(url),ONENET_OTA_URL"/%s/%s/check?type=%s&version=%s",ONENET_PRODUCT_ID,ONENET_DEVICE_NAME,type,version);
+    snprintf(url,256,ONENET_OTA_URL"/%s/%s/check?type=%s&version=%s",ONENET_PRODUCT_ID,ONENET_DEVICE_NAME,type,version);
     if(ESP_OK == onenet_ota_http_connect(url,HTTP_METHOD_GET,NULL))
     {
-        cJSON *root = cJSON_Parse((const char*)ota_data_buffer); //解析JSON数据
+        cJSON *root =  cJSON_Parse((const char*)ota_data_buffer);
         if(root)
         {
-            cJSON *code_js = cJSON_GetObjectItem(root, "code");
-            cJSON *data_js = cJSON_GetObjectItem(root, "data");
-            cJSON *target_js = cJSON_GetObjectItem(root, "target");
-            cJSON *tid_js = cJSON_GetObjectItem(root, "tid");
-
+            cJSON* code_js =  cJSON_GetObjectItem(root,"code");    //错误代码
+            cJSON *data_js = cJSON_GetObjectItem(root,"data");
+            cJSON* target_js = cJSON_GetObjectItem(data_js,"target");
+            cJSON* tid_js = cJSON_GetObjectItem(data_js,"tid");
             if(code_js && cJSON_GetNumberValue(code_js) == 0)
             {
-                if(data_js && target_js && tid_js)
+                if(target_js && tid_js)    //我们感兴趣的只有任务id和目标版本号
                 {
                     snprintf(target_version,sizeof(target_version),"%s",cJSON_GetStringValue(target_js));
-                    task_id = cJSON_GetNumberValue(tid_js);
-                    ESP_LOGI(TAG, "OTA new version available: %s, download url: %s, tid: %s", target_version, download_url, tid);
+                    task_id = cJSON_GetNumberValue(tid_js);    //取出任务id
                     ret = ESP_OK;
                 }
             }
-            else
+            else 
             {
-                ESP_LOGE(TAG, "OTA check task failed");
+                ESP_LOGI(TAG,"Check ota task invaild code");
             }
             cJSON_Delete(root);
         }
+        else
+        {
+            ESP_LOGI(TAG,"Check ota task fail!");
+            return ret;
+        }
+    }
+    else
+    {
+        return ret;
     }
     return ret;
 }
-
 
 /*
 设备可以根据升级包的下载情况，上报下载进度和下载结果。
@@ -274,14 +293,14 @@ Content-Length:20
 */
 
 
-esp_err_t onenet_ota_download_upload(int tid,int step)//上报升级状态（固件下载进度百分比）
+esp_err_t onenet_ota_upload_status(int tid,int step)//上报升级状态（固件下载进度百分比）
 {
     char url[128] = {0};
     char payload[64] = {0};
     esp_err_t ret = ESP_FAIL;
-    snprintf(url,sizeof(url),ONENET_OTA_URL"/%s/%s/%s/status",ONENET_PRODUCT_ID,ONENET_DEVICE_NAME,tid);
+    snprintf(url,sizeof(url),ONENET_OTA_URL"/%s/%s/%d/status",ONENET_PRODUCT_ID,ONENET_DEVICE_NAME,tid);
     snprintf(payload,sizeof(payload),"{\"step\":%d}",step);
-    if(onenet_ota_http_connect(url,HTTP_METHOD_POST,payload) = ESP_OK)
+    if(onenet_ota_http_connect(url,HTTP_METHOD_POST,payload) == ESP_OK)
     {
         cJSON *root = cJSON_Parse((const char*)ota_data_buffer); //解析JSON数据
         if(root)
@@ -301,5 +320,113 @@ esp_err_t onenet_ota_download_upload(int tid,int step)//上报升级状态（固
         ESP_LOGE(TAG, "OTA version upload failed");
     }
     return ret;
+}
+
+esp_err_t onenet_ota_init_cb(esp_http_client_handle_t client)
+{
+    static char token[256];
+    memset(token,0,256);
+    dev_token_generate(token,SIG_METHOD_SHA256,TOKEN_VALIDITY_PERIOD,ONENET_PRODUCT_ID,NULL,ONENET_PRODUCT_ACCESS_KEY);
+    ESP_LOGI(TAG,"OTA token:%s",token);
+    // POST
+    esp_http_client_set_method(client, HTTP_METHOD_GET);
+    esp_http_client_set_header(client,"Content-Type", "application/json");
+    esp_http_client_set_header(client,"Authorization",token);
+    esp_http_client_set_header(client,"host","iot-api.heclouds.com");
+    return ESP_OK;
+}
+
+/*
+检查到升级任务后，设备根据任务信息进行升级包下载.
+
+GET 
+http://iot-api.heclouds.com/fuse-ota/{pro_id}/{dev_name}/{tid}/download
+
+Authorization:version=2022-05-01&res=userid%2F112&et=1662515432&method=sha1&sign=Pd14JLeTo77e0FOpKN8bR1INPLA%3D
+
+host:iot-api.heclouds.com
+
+*/
+
+
+esp_err_t onenet_ota_download(int tid)//下载升级包请求
+{
+    esp_err_t ota_finish_err = ESP_OK;
+    char url[256] = {0};
+    snprintf(url,sizeof(url),ONENET_OTA_URL"/%s/%s/%d/download",ONENET_PRODUCT_ID,ONENET_DEVICE_NAME,tid);
+    esp_http_client_config_t http_config = 
+    {
+        .url = url,
+    };
+
+    esp_https_ota_config_t ota_config = 
+    {
+        .http_config = &http_config,
+        .http_client_init_cb =  onenet_ota_init_cb,//此回调函数在esp_https_ota发起http请求之前被调用，给你一个设置请求头的机会
+    };
+    ota_finish_err = esp_https_ota(&ota_config);    //执行ota下载
+    if(ota_finish_err == ESP_OK)
+    {
+        ESP_LOGI(TAG, "ESP_HTTPS_OTA upgrade successful. Rebooting ...");
+    }
+    else
+    {
+        ESP_LOGE(TAG, "ESP_HTTPS_OTA upgrade failed 0x%x", ota_finish_err);
+    }
+    return ota_finish_err;
+}
+
+static void onenet_ota_task(void *param)
+{
+    esp_err_t ret;
+    //上报当前版本号
+    ret = onenet_ota_upload_version();
+    if(ret != ESP_OK)
+    {
+        ESP_LOGE(TAG,"Upload version faild!");
+        goto delete_ota_task;
+    }
+    //检测升级任务
+    ret = onenet_ota_check_task("1",get_app_version());
+    if(ret != ESP_OK)
+    {
+        ESP_LOGE(TAG,"Check ota task faild!");
+        goto delete_ota_task;
+    }
+    //上报任务升级状态
+    ret = onenet_ota_upload_status(task_id,10);
+    if(ret != ESP_OK)
+    {
+        ESP_LOGE(TAG,"upload status faild!");
+        goto delete_ota_task;
+    }
+    //进行http下载
+    ret = onenet_ota_download(task_id);
+    if(ret != ESP_OK)
+    {
+        ESP_LOGE(TAG,"ota down load faild!");
+        goto delete_ota_task;
+    }
+    //上报任务升级状态
+    ret = onenet_ota_upload_status(task_id,100);
+    //重启
+    esp_restart();
+delete_ota_task:
+    ota_is_running = false;
+    vTaskDelete(NULL);
+}
+
+/**
+ * 启动onenet ota升级流程
+ * @param 无
+ * @return 无
+ */
+void onenet_ota_start(void)
+{
+    if(ota_is_running)
+        return;
+    ota_is_running = true;
+    ESP_LOGI(TAG,"Start OTA");
+    xTaskCreatePinnedToCore(onenet_ota_task,"onenet_ota",8192,NULL,2,NULL,1);
 }
 

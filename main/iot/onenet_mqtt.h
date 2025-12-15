@@ -1,7 +1,8 @@
 #ifndef _ONENET_MQTT_H_
 #define _ONENET_MQTT_H_
 #include "esp_err.h"
-
+#include "mqtt_client.h"
+#include "onenet_ota.h"
 //产品ID
 #define ONENET_PRODUCT_ID      "5x8qhBrKw5"
 

@@ -60,6 +60,7 @@ E:/soft/ESP-project/esp32-demo-Assembly/Demo_onenet/build/esp-idf/http_parser/li
 E:/soft/ESP-project/esp32-demo-Assembly/Demo_onenet/build/esp-idf/esp-tls/libesp-tls.a
 E:/soft/ESP-project/esp32-demo-Assembly/Demo_onenet/build/esp-idf/esp_adc/libesp_adc.a
 E:/soft/ESP-project/esp32-demo-Assembly/Demo_onenet/build/esp-idf/esp_driver_cam/libesp_driver_cam.a
+E:/soft/ESP-project/esp32-demo-Assembly/Demo_onenet/build/esp-idf/esp_psram/libesp_psram.a
 E:/soft/ESP-project/esp32-demo-Assembly/Demo_onenet/build/esp-idf/esp_eth/libesp_eth.a
 E:/soft/ESP-project/esp32-demo-Assembly/Demo_onenet/build/esp-idf/esp_hid/libesp_hid.a
 E:/soft/ESP-project/esp32-demo-Assembly/Demo_onenet/build/esp-idf/tcp_transport/libtcp_transport.a

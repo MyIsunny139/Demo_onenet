@@ -28,7 +28,14 @@ static void wifi_state_callback(WIFI_STATE event)
 
 void app_main(void)
 {
-    nvs_flash_init();
+    // 初始化NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+      ESP_ERROR_CHECK(nvs_flash_erase());
+      ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
     wifi_event_group = xEventGroupCreate();
     onenet_dm_init();
     wifi_manager_init(wifi_state_callback);

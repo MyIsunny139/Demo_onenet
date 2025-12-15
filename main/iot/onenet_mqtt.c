@@ -34,10 +34,13 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     case MQTT_EVENT_CONNECTED:
     {
         ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
+        
         onenet_subscribe();
         cJSON* property_js = onenet_property_upload(); //上传属性数据
         char * data = cJSON_PrintUnformatted(property_js); //转换为字符串
         onenet_post_property_data(data); //设备上线后，上传属性数据
+        onenet_ota_upload_version(); //连接成功后上传固件版本号
+        set_app_valid(1); //设置当前应用为有效,取消回滚
         free(data);
         cJSON_Delete(property_js);
         break;
@@ -86,6 +89,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             cJSON_Delete(ota_json);
             // 处理OTA更新逻辑
             
+            //开启OTA升级任务
+            onenet_ota_start();
+
         }
 
 
