@@ -40,7 +40,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         char * data = cJSON_PrintUnformatted(property_js); //转换为字符串
         onenet_post_property_data(data); //设备上线后，上传属性数据
         onenet_ota_upload_version(); //连接成功后上传固件版本号
-        set_app_valid(1); //设置当前应用为有效,取消回滚
+        set_app_vaild(1); //设置当前应用为有效,取消回滚
         free(data);
         cJSON_Delete(property_js);
         break;

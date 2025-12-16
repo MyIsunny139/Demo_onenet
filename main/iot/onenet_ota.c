@@ -1,228 +1,153 @@
 #include "onenet_ota.h"
-#include "esp_ota_ops.h"
-#include "stdio.h"
-#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_http_client.h"
 #include "onenet_token.h"
 #include "onenet_mqtt.h"
-#include "string.h"
+#include "esp_log.h"
 #include "cJSON.h"
+#include "esp_ota_ops.h"
 #include "esp_https_ota.h"
-#include "esp_system.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
+#include "esp_crt_bundle.h"
 
+#define TAG     "onenet_ota"
 
-#define TAG "ONENET_OTA"
-
-#define ONENET_OTA_URL "http://iot-api.heclouds.com/fuse-ota"
-
-#define TOKEN_VALIDITY_PERIOD 2074816291 //token有效期，单位秒
-
-static char target_version[32] = {0};
-static int task_id = 0;
+#define     MAX_DATA_BUFF   1024
+//ota基础url
+#define     ONENET_OTA_URL  "http://iot-api.heclouds.com/fuse-ota"
+//token合法时间戳
+#define     TOKEN_TIMESTAMP     1924833600
+//接收到的http 数据
+static uint8_t data_buff[MAX_DATA_BUFF];
+//接收到的http数据长度
+static size_t   data_buff_len = 0;
+//ota升级任务id
+static int  task_id = 0;
+//要升级到的版本号
+static char target_version[16] = {0}; 
+//ota任务是否在运行
 static bool ota_is_running = false;
 
 
-const char* get_app_version(void) //获取当前应用版本号
-{
-    static char app_version[32] = {0};
-    if(app_version[0] == 0)
-    {
-        const esp_partition_t * running =  esp_ota_get_running_partition(); //获取当前运行分区
-        esp_app_desc_t app_desc;
-        esp_ota_get_partition_description(running ,&app_desc);  //获取分区描述信息
-        snprintf(app_version, sizeof(app_version), "%s", app_desc.version); //获取版本号
-    }
-    return app_version;
-}
-
-void set_app_valid(int valid) //
-{
-    const esp_partition_t * running =  esp_ota_get_running_partition(); //获取当前运行分区
-    esp_ota_img_states_t ota_state;
-    //获取当前分区OTA状态
-    if(esp_ota_get_state_partition(running, &ota_state)== ESP_OK)
-    {
-        if(ota_state == ESP_OTA_IMG_PENDING_VERIFY) //如果当前状态是待验证且需要设置为有效
-        {
-            if(valid)
-            {
-                esp_ota_mark_app_valid_cancel_rollback(); //设置当前分区为有效，取消回滚
-                ESP_LOGE(TAG ,"Set app valid success\r\n");
-            }
-            else
-            {
-                esp_ota_mark_app_invalid_rollback_and_reboot(); //设置当前分区为无效，回滚到上一个分区并重启
-                ESP_LOGE(TAG ,"Set app invalid and reboot\r\n");
-            }
-        }
-    }
-}
-
-#define OTA_BUFF_LEN 1024
-static uint8_t ota_data_buffer[OTA_BUFF_LEN];
-static int ota_data_size = 0;
-
-
-esp_err_t _http_event_handler(esp_http_client_event_t *evt)
+static esp_err_t http_client_event_handler(esp_http_client_event_t *evt)
 {
     switch(evt->event_id) {
-        case HTTP_EVENT_ERROR:
-            ESP_LOGI(TAG, "HTTP_EVENT_ERROR");
+        case HTTP_EVENT_ERROR:    //错误事件
+            //ESP_LOGI(TAG, "HTTP_EVENT_ERROR");
             break;
-        case HTTP_EVENT_ON_CONNECTED:
-            ESP_LOGI(TAG, "HTTP_EVENT_ON_CONNECTED");
+        case HTTP_EVENT_ON_CONNECTED:    //连接成功事件
+            //ESP_LOGI(TAG, "HTTP_EVENT_ON_CONNECTED");
             break;
-        case HTTP_EVENT_HEADER_SENT:
-            ESP_LOGI(TAG, "HTTP_EVENT_HEADER_SENT");
+        case HTTP_EVENT_HEADER_SENT:    //发送头事件
+            //ESP_LOGI(TAG, "HTTP_EVENT_HEADER_SENT");
             break;
-        case HTTP_EVENT_ON_HEADER:
-            ESP_LOGI(TAG, "HTTP_EVENT_ON_HEADER, key=%s, value=%s", evt->header_key, evt->header_value);
+        case HTTP_EVENT_ON_HEADER:    //接收头事件
+            //ESP_LOGI(TAG, "HTTP_EVENT_ON_HEADER");
+            printf("%.*s", evt->data_len, (char*)evt->data);
             break;
-        case HTTP_EVENT_ON_DATA:
-        {
-            ESP_LOGI(TAG, "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
-            printf("HTTP_EVENT_ON_DATA : %.*s\r\n", evt->data_len, (char*)evt->data);
-            int copy_len = 0;
-            if(evt->data_len >OTA_BUFF_LEN - ota_data_size) //
+        case HTTP_EVENT_ON_DATA:    //接收数据事件
             {
-                copy_len = OTA_BUFF_LEN - ota_data_size;
+                size_t copy_len = 0;
+                ESP_LOGI(TAG, "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
+                printf("HTTP_EVENT_ON_DATA data=%.*s\r\n", evt->data_len,(char*)evt->data);
+                if(evt->data_len > MAX_DATA_BUFF - data_buff_len)
+                {
+                    copy_len = MAX_DATA_BUFF - data_buff_len;
+                }
+                else
+                {
+                    copy_len = evt->data_len;
+                }
+                memcpy(&data_buff[data_buff_len],evt->data,copy_len);
+                data_buff_len += copy_len;
             }
-            else
-            {
-                copy_len = evt->data_len;
-            }
-            memcpy(&ota_data_buffer[ota_data_size], evt->data, copy_len);
-            ota_data_size += copy_len;
             break;
-        }
-            
-        case HTTP_EVENT_ON_FINISH:
-            ESP_LOGI(TAG, "HTTP_EVENT_ON_FINISH");
+        case HTTP_EVENT_ON_FINISH:    //会话完成事件
+            data_buff_len = 0;
             break;
-        case HTTP_EVENT_DISCONNECTED:
-            ESP_LOGI(TAG, "HTTP_EVENT_DISCONNECTED");
+        case HTTP_EVENT_DISCONNECTED:    //断开事件
+            //ESP_LOGI(TAG, "HTTP_EVENT_DISCONNECTED");
+            data_buff_len = 0;
             break;
         case HTTP_EVENT_REDIRECT:
-            ESP_LOGI(TAG, "HTTP_EVENT_REDIRECT");
-            break;
-        default:
+            //ESP_LOGI(TAG, "HTTP_EVENT_REDIRECT");
             break;
     }
     return ESP_OK;
 }
 
-/*
-Content-Type: application/json
-
-Authorization:version=2022-05-01&res=userid%2F112&et=1662515432&method=sha1&sign=Pd14JLeTo77e0FOpKN8bR1INPLA%3D 
-
-host:iot-api.heclouds.com
-
-Content-Length:20       长度会自己计算，不需要你做
-*/
-
-static esp_err_t onenet_ota_http_connect(const char *url,esp_http_client_method_t method,const char *payload)
+static esp_err_t onenet_ota_http_connect(const char* url,esp_http_client_method_t method,char* post_data)
 {
-    esp_http_client_config_t config = {
-        .url = url,
-        .event_handler = _http_event_handler,
-    };
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    char *token = (char *)malloc(256);
-    memset(token,0,256);
-    dev_token_generate(token,SIG_METHOD_SHA256,TOKEN_VALIDITY_PERIOD,ONENET_PRODUCT_ID,NULL,ONENET_PRODUCT_ACCESS_KEY);
-    ESP_LOGI(TAG,"OTA token:%s",token);
-    // POST
-    esp_http_client_set_method(client, method);
-    esp_http_client_set_header(client,"Content-Type", "application/json");
-    esp_http_client_set_header(client,"Authorization",token);
-    esp_http_client_set_header(client,"host","iot-api.heclouds.com");
-    
-    if(payload)
+    esp_http_client_config_t config =
     {
-        ESP_LOGI(TAG, "Payload: %s", payload);
-        esp_http_client_set_post_field(client, payload, strlen(payload));
+        .url = url,
+        .event_handler = http_client_event_handler,
+    };
+    //初始化结构体
+    esp_http_client_handle_t http_client = esp_http_client_init(&config);	//初始化http连接
+    if(!http_client)
+    {
+        ESP_LOGI(TAG,"http_client init fail!");
+        return ESP_FAIL;
     }
-    memset(ota_data_buffer,0,sizeof(ota_data_buffer));
-    ota_data_size = 0;
-    esp_err_t err = esp_http_client_perform(client); //执行HTTP请求
+
+    char* token = (char*)malloc(256);
+    memset(token,0,256);
+    //user_token_generate(token,SIG_METHOD_SHA256,1924833600,USER_ID,USER_ACCESS_KEY);
+    dev_token_generate(token,SIG_METHOD_SHA256,TOKEN_TIMESTAMP,ONENET_PRODUCT_ID,NULL,ONENET_PRODUCT_ACCESS_KEY);
+    ESP_LOGI(TAG,"user token:%s",token);
+    //设置发送请求 
+    esp_http_client_set_method(http_client, method);
+    esp_http_client_set_header(http_client,"Content-Type","application/json");
+    esp_http_client_set_header(http_client,"Authorization",token);
+    esp_http_client_set_header(http_client,"host","iot-api.heclouds.com");
+    if(post_data)
+    {
+        ESP_LOGI(TAG,"post data:%s",post_data);
+        esp_http_client_set_post_field(http_client,post_data,strlen(post_data));
+    }
+    data_buff_len = 0;
+    memset(data_buff,0,sizeof(data_buff));
+    esp_err_t err  = esp_http_client_perform(http_client);
     free(token);
-    esp_http_client_cleanup(client);
+    esp_http_client_cleanup(http_client);
     return err;
 }
 
-
-
-esp_err_t onenet_ota_upload_version(void) //
+/**
+ * 上报版本号
+ * @param 无
+ * @return 错误码
+ */
+esp_err_t onenet_ota_upload_version(void)
 {
-    char url[128] = {0};
-    char version[128] = {0};
-    const char * app_version = get_app_version();
+    //格式：{"s_version":"V1.3", "f_version": "V2.0"}
+    char version_info[128];
+    char url[256];
     esp_err_t ret = ESP_FAIL;
-    snprintf(url,sizeof(url),ONENET_OTA_URL"/%s/%s/version",ONENET_PRODUCT_ID,ONENET_DEVICE_NAME);
-    snprintf(version,sizeof(version),"{\"s_version\":\"%s\", \"f_version\": \"%s\"}",app_version, app_version);
-    if(onenet_ota_http_connect(url,HTTP_METHOD_POST,version) == ESP_OK)
+    const char* version = get_app_verion();
+    snprintf(version_info,sizeof(version_info),"{\"s_version\":\"%s\", \"f_version\": \"%s\"}",version,version);
+    snprintf(url,256,ONENET_OTA_URL"/%s/%s/version",ONENET_PRODUCT_ID,ONENET_DEVICE_NAME);
+    if(ESP_OK == onenet_ota_http_connect(url,HTTP_METHOD_POST,version_info))
     {
-        cJSON *root = cJSON_Parse((const char*)ota_data_buffer); //解析JSON数据
+        cJSON *root = cJSON_Parse((const char*)data_buff);
         if(root)
         {
-            cJSON *code_js = cJSON_GetObjectItem(root, "code");
+            cJSON* code_js =  cJSON_GetObjectItem(root,"code");
             if(code_js && cJSON_GetNumberValue(code_js) == 0)
-            {
                 ret = ESP_OK;
-            }
-            else
-            {
-                if(code_js) ESP_LOGE(TAG, "OTA version upload failed, code: %d", (int)cJSON_GetNumberValue(code_js));
-            }
             cJSON_Delete(root);
         }
     }
-    if(ret != ESP_OK)
+    else
     {
-        ESP_LOGE(TAG, "OTA version upload failed");
+        ESP_LOGI(TAG,"Upload version fail!");
+        return ret;
     }
     return ret;
 }
 
-/*
-检测升级任务，esp32通过发送下面这一堆来获取升级任务信息：
-（第2到4已在onenet_ota_http_connect里面生成过了）
-
-GET http://iot-api.heclouds.com/fuse-ota/{pro_id}/{dev_name}/check?type=1&version=1.2
-Content-Type: application/json
-
-Authorization:version=2022-05-01&res=userid%2F112&et=1662515432&method=sha1&sign=Pd14JLeTo77e0FOpKN8bR1INPLA%3D
-
-host:iot-api.heclouds.com
-
-Content-Length:20
-
-发送完后，回复如下：
-（只需要关注code，data里面的target，tid）
-{
-	"code": 0,
-	"msg": "succ",
-	"request_id": "**********",
-	"data": {
-		"target": "1.2", // 升级任务的目标版本
-		"tid": 12, //任务ID
-		"size": 123, //文件大小
-		"md5": "dfkdajkfd", //升级文件的md5
-		"status": 1 | 2 | 3, //1 ：待升级， 2 ：下载中， 3 ：升级中
-		"type": 1 | 2 // 1:完整包，2：差分包  
-	}
-}
-*/
-
-/**
- * 查询升级任务状态
- * @param type = 1,说明是完整包，type=2,说明是差分包
- * @param version 当前设备版本
- * @return 错误码
- */
 esp_err_t  onenet_ota_check_task(const char* type,const char* version)
 {
     char url[256];
@@ -230,19 +155,19 @@ esp_err_t  onenet_ota_check_task(const char* type,const char* version)
     snprintf(url,256,ONENET_OTA_URL"/%s/%s/check?type=%s&version=%s",ONENET_PRODUCT_ID,ONENET_DEVICE_NAME,type,version);
     if(ESP_OK == onenet_ota_http_connect(url,HTTP_METHOD_GET,NULL))
     {
-        cJSON *root =  cJSON_Parse((const char*)ota_data_buffer);
+        cJSON *root =  cJSON_Parse((const char*)data_buff);
         if(root)
         {
-            cJSON* code_js =  cJSON_GetObjectItem(root,"code");    //错误代码
+            cJSON* code_js =  cJSON_GetObjectItem(root,"code");
             cJSON *data_js = cJSON_GetObjectItem(root,"data");
             cJSON* target_js = cJSON_GetObjectItem(data_js,"target");
             cJSON* tid_js = cJSON_GetObjectItem(data_js,"tid");
             if(code_js && cJSON_GetNumberValue(code_js) == 0)
             {
-                if(target_js && tid_js)    //我们感兴趣的只有任务id和目标版本号
+                if(target_js && tid_js)
                 {
                     snprintf(target_version,sizeof(target_version),"%s",cJSON_GetStringValue(target_js));
-                    task_id = cJSON_GetNumberValue(tid_js);    //取出任务id
+                    task_id = cJSON_GetNumberValue(tid_js);
                     ret = ESP_OK;
                 }
             }
@@ -265,109 +190,66 @@ esp_err_t  onenet_ota_check_task(const char* type,const char* version)
     return ret;
 }
 
-/*
-设备可以根据升级包的下载情况，上报下载进度和下载结果。
-下面是具体内容
-
-POST http://iot-api.heclouds.com/fuse-ota/{pro_id}/{dev_name}/{tid}/status
-
-
-Content-Type: application/json
-
-Authorization:version=2022-05-01&res=userid%2F112&et=1662515432&method=sha1&sign=Pd14JLeTo77e0FOpKN8bR1INPLA%3D 
-
-host:iot-api.heclouds.com
-
-Content-Length:20
-
-
-{"step":10} 
-
-回复：
+esp_err_t onenet_ota_upload_status(int tid,int step)
 {
-	"code": 0,
-	"msg": "succ",
-	"request_id": "**********"
-}
-这里依然只关注code字段，0表示成功，非0表示失败。
-*/
-
-
-esp_err_t onenet_ota_upload_status(int tid,int step)//上报升级状态（固件下载进度百分比）
-{
-    char url[128] = {0};
-    char payload[64] = {0};
+    char url[256];
+    char payload[32];
     esp_err_t ret = ESP_FAIL;
-    snprintf(url,sizeof(url),ONENET_OTA_URL"/%s/%s/%d/status",ONENET_PRODUCT_ID,ONENET_DEVICE_NAME,tid);
+    snprintf(url,256,ONENET_OTA_URL"/%s/%s/%d/status",ONENET_PRODUCT_ID,ONENET_DEVICE_NAME,tid);
     snprintf(payload,sizeof(payload),"{\"step\":%d}",step);
-    if(onenet_ota_http_connect(url,HTTP_METHOD_POST,payload) == ESP_OK)
+    if(ESP_OK == onenet_ota_http_connect(url,HTTP_METHOD_POST,payload))
     {
-        cJSON *root = cJSON_Parse((const char*)ota_data_buffer); //解析JSON数据
+        cJSON *root = cJSON_Parse((const char*)data_buff);
         if(root)
         {
-            cJSON *code_js = cJSON_GetObjectItem(root, "code");//
+            cJSON* code_js =  cJSON_GetObjectItem(root,"code");
             if(code_js && cJSON_GetNumberValue(code_js) == 0)
-            {
-                ESP_LOGE(TAG, "OTA version upload code: %d", code_js->valueint); 
                 ret = ESP_OK;
-                cJSON_Delete(root);
-            }
             cJSON_Delete(root);
         }
     }
-    if(ret != ESP_OK)
+    else
     {
-        ESP_LOGE(TAG, "OTA version upload failed");
+        ESP_LOGI(TAG,"Upload status fail!");
+        return ret;
     }
     return ret;
 }
 
-esp_err_t onenet_ota_init_cb(esp_http_client_handle_t client)
+static esp_err_t http_ota_init_callback(esp_http_client_handle_t http_client)
 {
     static char token[256];
     memset(token,0,256);
-    dev_token_generate(token,SIG_METHOD_SHA256,TOKEN_VALIDITY_PERIOD,ONENET_PRODUCT_ID,NULL,ONENET_PRODUCT_ACCESS_KEY);
-    ESP_LOGI(TAG,"OTA token:%s",token);
-    // POST
-    esp_http_client_set_method(client, HTTP_METHOD_GET);
-    esp_http_client_set_header(client,"Content-Type", "application/json");
-    esp_http_client_set_header(client,"Authorization",token);
-    esp_http_client_set_header(client,"host","iot-api.heclouds.com");
+    dev_token_generate(token,SIG_METHOD_SHA256,TOKEN_TIMESTAMP,ONENET_PRODUCT_ID,NULL,ONENET_PRODUCT_ACCESS_KEY);
+    ESP_LOGI(TAG,"user token:%s",token);
+    //设置发送请求 
+    esp_http_client_set_method(http_client, HTTP_METHOD_GET);
+    esp_http_client_set_header(http_client,"Content-Type","application/json");
+    esp_http_client_set_header(http_client,"Authorization",token);
+    esp_http_client_set_header(http_client,"host","iot-api.heclouds.com");
     return ESP_OK;
 }
 
-/*
-检查到升级任务后，设备根据任务信息进行升级包下载.
-
-GET 
-http://iot-api.heclouds.com/fuse-ota/{pro_id}/{dev_name}/{tid}/download
-
-Authorization:version=2022-05-01&res=userid%2F112&et=1662515432&method=sha1&sign=Pd14JLeTo77e0FOpKN8bR1INPLA%3D
-
-host:iot-api.heclouds.com
-
-*/
-
-
-esp_err_t onenet_ota_download(int tid)//下载升级包请求
+esp_err_t onenet_ota_download(int tid)
 {
     esp_err_t ota_finish_err = ESP_OK;
-    char url[256] = {0};
+    char url[256];
     snprintf(url,sizeof(url),ONENET_OTA_URL"/%s/%s/%d/download",ONENET_PRODUCT_ID,ONENET_DEVICE_NAME,tid);
-    esp_http_client_config_t http_config = 
+    esp_http_client_config_t config =
     {
         .url = url,
+        .crt_bundle_attach = esp_crt_bundle_attach,
     };
 
-    esp_https_ota_config_t ota_config = 
-    {
-        .http_config = &http_config,
-        .http_client_init_cb =  onenet_ota_init_cb,//此回调函数在esp_https_ota发起http请求之前被调用，给你一个设置请求头的机会
+    esp_https_ota_config_t ota_config = {
+        .http_config = &config,
+        .http_client_init_cb = http_ota_init_callback,
     };
-    ota_finish_err = esp_https_ota(&ota_config);    //执行ota下载
+    ota_finish_err = esp_https_ota(&ota_config);
     if(ota_finish_err == ESP_OK)
     {
         ESP_LOGI(TAG, "ESP_HTTPS_OTA upgrade successful. Rebooting ...");
+
     }
     else
     {
@@ -387,7 +269,7 @@ static void onenet_ota_task(void *param)
         goto delete_ota_task;
     }
     //检测升级任务
-    ret = onenet_ota_check_task("1",get_app_version());
+    ret = onenet_ota_check_task("1",get_app_verion());
     if(ret != ESP_OK)
     {
         ESP_LOGE(TAG,"Check ota task faild!");
@@ -430,3 +312,46 @@ void onenet_ota_start(void)
     xTaskCreatePinnedToCore(onenet_ota_task,"onenet_ota",8192,NULL,2,NULL,1);
 }
 
+/**
+ * 获取应用程序版本号
+ * @param 无
+ * @return 版本号
+ */
+const char* get_app_verion(void)
+{
+    static char app_version[32] = {0};
+    if(app_version[0] == 0)
+    {
+        //获取当前运行的app分区信息
+        const esp_partition_t *running = esp_ota_get_running_partition();
+        esp_app_desc_t running_app_info;
+        //根据app分区信息获取app描述信息
+        esp_ota_get_partition_description(running, &running_app_info);
+        snprintf(app_version,sizeof(app_version),"%s",running_app_info.version);
+    }
+    return app_version;
+}
+
+/**
+ * 设置合法启动分区
+ * @param vaild 是否合法
+ * @return 无
+ */
+void set_app_vaild(int vaild)
+{
+    //获取当前运行的app分区信息
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t ota_state;
+    //获取当前运行的app状态
+    if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) 
+    {
+        //如果是校验状态
+        if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) 
+        {
+            if(vaild)
+                esp_ota_mark_app_valid_cancel_rollback();   //设置成合法
+            else
+                esp_ota_mark_app_invalid_rollback_and_reboot(); //设置成非法并重启
+        }
+    }
+}
